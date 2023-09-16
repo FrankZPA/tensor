@@ -1,0 +1,1304 @@
+#!/usr/bin/env python
+
+# DJP - code for use in parsing a model to generate a tensor structured as nested array x, y, z, channel
+# intended to be used as part of building datasets for use in building and testing convolution NN with tensor flow
+
+
+
+
+import sys
+import math
+import numpy as np
+import itertools
+from operator import attrgetter
+from Bio.PDB import DSSP
+from Bio.PDB import NeighborSearch
+from Bio.PDB import is_aa
+from Bio.PDB.mmcifio import MMCIFIO
+from Bio.PDB.ResidueDepth import get_surface
+from Bio.PDB.ResidueDepth import min_dist
+from cif_parsing import dssp_ss_simple
+from cif_parsing import aa_sc_h_donor_atoms
+from cif_parsing import aa_sc_h_acceptor_atoms
+from cif_parsing import aa_res_structure
+from cif_parsing import aa_res_hydrogens
+from cif_parsing import aa_res_nonpolar_heavy_atoms
+from cif_parsing import aa_res_sc_aromatics
+from cif_parsing import aa_res_sc_pis
+from cif_parsing import get_h_hat_angle
+from cif_parsing import get_mm_enthalpy
+from cif_parsing import get_average_of_vectors
+from cif_parsing import infer_donor_h_coord
+from cif_parsing import get_tetrahedral_coords
+from cif_parsing import get_monofork_h_coord
+from cif_parsing import get_bifork_h_coord
+from cif_parsing import get_mc_donor_nh
+from cif_parsing import HBondPair
+from cif_parsing import aa_depth_solvent_params
+
+from MMCIF import MMCIFParser as mmcifp
+
+#import pymol       # for h_add - however, the naming, numbering og Hs is chaotic and the position assignment is very naive
+
+
+# example file to work with for work-up and testing
+pdb_id = "1TUP"
+cif_file = "cifs/1tup.cif"
+wt_cif_file = "cifs/1tup.cif"
+wt_h_cif_file = "hcifs/1tup_h.cif"
+
+#pdb_id = "1A23"
+#cif_file = "cifs/1a23.cif"
+#wt_h_cif_file = "hcifs/1a23_h.cif"
+
+pka_file = "pkas/1tup.pka"
+
+mut_cif_file = "mutant_cifs/1tupLEU94.cif"
+
+#print(dir(pymol))
+#pymol2.PyMOL() as pymol:
+#pymol.cmd.load(wt_cif_file) # file
+#pymol.cmd.h_add()
+#pymol.cmd.save(wt_h_cif_file)
+
+chain = "A"
+res_num = 156
+#res_num = 94   # EDGE CASE PROBLEM WHERE get_mc_donor_nh from cif_parsing requires previous residue to exist in the structure
+#res_num = 25
+voxel_edge = 10              # Angstroms - the length of a unit voxel edge
+num_row_voxels = 3         # number of voxels making up a tensor edge - expect this to be odd to allow centring in a mid-tensor voxel
+
+#c_num = 7                       # total number of channels
+
+tensor_channels = [
+"n_channel",
+"c_channel",
+"o_channel",
+"s_channel",
+"h_channel",
+"nonpolar_heavy",
+"polar_or_charged_heavy",
+"hbond_mm_enthalpy",
+"hbond_kortemme_energy",
+"depth",
+"pos_charge",
+"neg_charge",
+"aromatic",
+"non_aromatic_pi",
+"pipi",
+"cation_aromatic",
+"cation_non_aromatic_pi",
+"coulombic"
+]
+# secondary structure channel
+# are charge-polar interactions something to consider? Read on
+# measure of distance from focal residue CA - also some powered representation thereof to acknowledge relative importance of effects near the focal point
+# some powered representation of depth to allow non-linear effects other than coulombic and effective dielectric constant-related calculations
+# implement Ka profiling to allow better attribution of charge - especially for HIS but not exclusively
+# vdW attraction and repulsion effects
+
+
+
+def get_channel_indices(channels):
+    tensor_channel_indices = {}
+    i = 0
+    for channel in channels:
+        tensor_channel_indices[channel] = i
+        i += 1
+    return tensor_channel_indices
+
+def get_structure_object(pdb_id, cif_file):
+#    parser = MMCIFParser(QUIET = True)
+    parser = mmcifp(QUIET = True)
+    data = parser.get_structure(pdb_id, cif_file)
+    return data
+
+
+def get_aa_residues(sample_space):
+    aa_residues = []
+    for residue in sample_space:
+        if is_aa(residue):
+            aa_residues.append(residue)
+    return aa_residues
+
+
+def get_pkas(pka_filename):
+    pka_dict = {}
+    pka_handle = open(pka_filename, "r")
+    for line in pka_handle:
+        elements = line.strip().split()
+        if len(elements) == 5:
+            residue, number, chain, pka, model_pka = elements
+            if residue in ["ASP", "GLU", "HIS", "LYS", "ARG"]:
+                res_key = chain + residue + number
+                if res_key not in pka_dict:
+                    pka_dict[res_key] = float(pka)
+    return pka_dict 
+
+# https://www.egpat.com/blog/calculation-of-percentage-ionization
+def get_acid_charge_from_pka(pka):
+    ph = 7.0
+    fraction_ionized = (10 ** (ph - pka)) / (10 ** (ph - pka) + 1)
+    return fraction_ionized
+
+# https://www.egpat.com/blog/calculation-of-percentage-ionization
+def get_base_charge_from_pka(pka):
+    ph = 7.0
+    fraction_ionized = 1 / (1 + (10 ** (ph-pka)))
+    return fraction_ionized
+    
+
+
+# create an empty 4d nested array (tensor) - number of voxels specified by x_num, y_num, z_num
+# inner-most elements are x,y,z-indexed empty lists for future appending with channels information
+# array type
+def make_tensor_record(x_num, y_num, z_num, c_num):
+#    tensor_record = [[[[]]*z_num]*y_num]*x_num        # PROBLEM - unwanted behaviour - mutable object here means values are applied across the array
+    initial_array = []
+    for i in range(x_num):
+        initial_array.append([])
+        for j in range(y_num):
+            initial_array[i].append([])
+            for k in range(z_num):
+                initial_array[i][j].append([])
+                for c in range(c_num):
+                    initial_array[i][j][k].append(0)
+            
+    return initial_array
+
+def get_voxel_centre_coords(centre_coord, square_edge, num_squares):        # intended e.g. to obtain representative depth measure at centre of voxel
+    x_lower_coord = centre_coord[0] - ((num_squares * square_edge) / 2)
+    x_lower_centre = x_lower_coord + (square_edge / 2)
+    x_centres = []
+    y_lower_coord = centre_coord[1] - ((num_squares * square_edge) / 2)
+    y_lower_centre = y_lower_coord + (square_edge / 2)
+    y_centres = []
+    z_lower_coord = centre_coord[2] - ((num_squares * square_edge) / 2)
+    z_lower_centre = z_lower_coord + (square_edge / 2)
+    z_centres = []
+    for step in range(num_squares):
+        x_centres.append(x_lower_centre + (step * square_edge))
+        y_centres.append(y_lower_centre + (step * square_edge))
+        z_centres.append(z_lower_centre + (step * square_edge))
+    voxel_centre_coords = []
+    for x in x_centres:
+        for y in y_centres:
+            for z in z_centres:
+                voxel_centre_coord = np.array((x, y, z))
+                voxel_centre_coords.append(voxel_centre_coord)
+    return voxel_centre_coords
+
+def get_xyz_indices(test_coord, centre_coord, square_edge, num_squares):     # assumes that the test coordinate has already been checked as within tensor grid
+    x_lower_coord = centre_coord[0] - ((num_squares * square_edge) / 2)
+    test_x = ((test_coord[0] - x_lower_coord) / square_edge)
+    x_index = math.floor(test_x)
+    y_lower_coord = centre_coord[1] - ((num_squares * square_edge) / 2)
+    test_y = ((test_coord[1] - y_lower_coord) / square_edge)
+    y_index = math.floor(test_y)
+    z_lower_coord = centre_coord[2] - ((num_squares * square_edge) / 2)
+    test_z = ((test_coord[2] - z_lower_coord) / square_edge)
+    z_index = math.floor(test_z)
+    return x_index, y_index, z_index
+
+
+def is_coord_in_tensor(test_coord, centre_coord, square_edge, num_squares):     # ensure xyz are less than the outer bounding cube surface
+    outer_bound_dist = (num_squares * square_edge) / 2
+    if abs(test_coord[0] - centre_coord[0]) < outer_bound_dist:                 # check if x coord is in range
+        if abs(test_coord[1] - centre_coord[1]) < outer_bound_dist:             # check if y coord is in range
+            if abs(test_coord[2] - centre_coord[2]) < outer_bound_dist:         # check if z coord is in range
+                return True
+    else:
+        return False
+
+def get_sampling_radius(grid_edge):         # to get the spherical radius for the sphere that just contains the tensor grid cube
+    half_grid_edge = grid_edge / 2
+    sampling_radius = math.sqrt(2 * (half_grid_edge ** 2))
+    print("Sampling radius:", sampling_radius)
+    return sampling_radius
+
+def is_poss_hdonor(atom):                   # check if Atom a valid candidate hydrogen bond donor
+    if atom.element not in ["O", "N"]:
+        return False
+    elif (atom.name == "N"):
+        return True
+    else:
+        if atom.parent.resname not in aa_sc_h_donor_atoms:      # check 3 letter resname in the dict
+            return False
+        elif atom.name in aa_sc_h_donor_atoms[atom.parent.resname]:
+            return True
+        else:
+            return False
+
+def is_poss_hacceptor(atom):                   # check if Atom a valid candidate hydrogen bond acceptor
+    if atom.element not in ["O", "N"]:
+        return False
+    elif (atom.name == "O"):
+        return True
+    else:
+        if atom.parent.resname not in aa_sc_h_acceptor_atoms:      # check 3 letter resname in the dict
+            return False
+        elif atom.name in aa_sc_h_acceptor_atoms[atom.parent.resname]:
+            return True
+        else:
+            return False
+
+def get_poss_hacceptors(donor, ns):              # look for viable candidate acceptors to a candidate donor Atom
+    poss_acceptors = []
+    atoms_in_range = ns.search(donor.coord, 3.5, "A")
+    for atom in atoms_in_range:
+        if is_aa(atom.parent) and is_poss_hacceptor(atom):          # consider only amino acids and valid h acceptor candidate atoms
+            d_a_dist = np.linalg.norm((donor.coord - atom.coord))
+            if 2 <= d_a_dist <= 3.5:
+#                print(atom.parent.resname, atom.parent.id[1], atom, "IS CANDIDATE ACCEPTOR FOR", donor, d_a_dist)
+                h_hat_angle = get_h_hat_angle(donor, atom)
+#                print("h hat angle is", h_hat_angle)
+                if 90 <= h_hat_angle <= 180:
+                    poss_acceptors.append(atom)
+            else:
+#                print(atom.parent.resname, atom.parent.id[1], atom, "IS NOT AN ACCEPTABLE DISTANCE FROM", donor, d_a_dist)
+                continue
+    return poss_acceptors
+
+def get_poss_hdonors(acceptor, ns):              # look for viable candidate donors to a candidate acceptor Atom
+    poss_donors = []
+    atoms_in_range = ns.search(acceptor.coord, 3.5, "A")
+    for atom in atoms_in_range:
+        if is_aa(atom.parent) and is_poss_hdonor(atom):          # consider only amino acids and valid h donor candidate atoms
+            d_a_dist = np.linalg.norm((acceptor.coord - atom.coord))
+            if 2 <= d_a_dist <= 3.5:
+#                print(atom.parent.resname, atom.parent.id[1], atom, "IS CANDIDATE DONOR FOR", acceptor, d_a_dist)
+                h_hat_angle = get_h_hat_angle(atom, acceptor)
+#                print("h hat angle is", h_hat_angle)
+                if 90 <= h_hat_angle <= 180:
+                    poss_donors.append(atom)
+            else:
+#                print(atom.parent.resname, atom.parent.id[1], atom, "IS NOT AN ACCEPTABLE DISTANCE FROM", acceptor, d_a_dist)
+                continue
+    return poss_donors
+
+#def get_h_bond_enthalpy(donor, acceptor):      # expects donor and acceptor Atoms - Musin and Mariam formula - tested against paper Figure
+#    distance = np.linalg.norm(donor.coord - acceptor.coord)
+#    hb_enthalpy = - ((5.554 * (10 ** 5)) * (math.e ** (-4.12 * distance)))  # kcal/mol, where r is O...X distance angstroms, X = O or N - so O-H...O, N-H...O, O-H...N
+#    return hb_enthalpy 
+
+def get_average_coord(coord_list):      # expects a list of xyz numpy arrays
+    xyz = np.array([0, 0, 0], dtype = np.float32)
+    for coord in coord_list:
+        xyz += coord
+    xyz = xyz / len(coord_list)
+    return xyz
+
+def get_poss_das(atom, ns, donor_acceptor_set):          # arriving at a set of candidate (donor key, acceptor key) tuples for further processing
+    if is_poss_hdonor(atom):
+        donor_id = "_".join([atom.parent.parent.id, atom.parent.resname, str(atom.parent.id[1]), atom.name])
+#        print(atom, "IS A CANDIDATE H DONOR")
+#        print("DONOR ID", donor_id)
+        poss_hacceptors = get_poss_hacceptors(atom, ns)
+#        print("POSSIBLE ACCEPTORS", poss_hacceptors)
+        if poss_hacceptors == []:
+            pass
+        else:
+            for poss_hacceptor in poss_hacceptors:
+                acceptor_id = "_".join([poss_hacceptor.parent.parent.id, poss_hacceptor.parent.resname, str(poss_hacceptor.parent.id[1]), poss_hacceptor.name])
+#                print("ACCEPTOR ID", acceptor_id)
+                if (donor_id, acceptor_id) in donor_acceptor_set:         # check if already considered this donor, acceptor pair
+#                    print("SEEN THIS DONOR-ACCEPTOR PAIR BEFORE")
+                    continue
+                else:
+                    donor_acceptor_set.add((donor_id, acceptor_id))         # add tuple specifying the donor acceptor atoms
+    if is_poss_hacceptor(atom):
+        acceptor_id = "_".join([atom.parent.parent.id, atom.parent.resname, str(atom.parent.id[1]), atom.name])
+#        print(atom, "IS A CANDIDATE H ACCEPTOR")
+#        print("ACCEPTOR ID", acceptor_id)
+        poss_hdonors = get_poss_hdonors(atom, ns)
+#        print("POSSIBLE DONORS", poss_hdonors)
+        if poss_hdonors == []:
+            pass
+        else:
+            for poss_hdonor in poss_hdonors:
+                donor_id = "_".join([poss_hdonor.parent.parent.id, poss_hdonor.parent.resname, str(poss_hdonor.parent.id[1]), poss_hdonor.name])
+#                print("DONOR ID", donor_id)
+                if (donor_id, acceptor_id) in donor_acceptor_set:         # check if already considered this donor, acceptor pair
+#                    print("SEEN THIS DONOR-ACCEPTOR PAIR BEFORE")
+                    continue
+                else:
+                    donor_acceptor_set.add((donor_id, acceptor_id))         # add tuple specifying the donor acceptor atoms
+    return donor_acceptor_set
+
+"""
+def get_all_hnet_cands(donor_acceptor_set, model, model_dssp):        # get all possible players in a network - naively assuming independence of D-A pair
+# respecting valency for the D-A pair but not across the network
+    donor_acceptor_list = []
+    for pair in donor_acceptor_set:
+        donor_key, acceptor_key = pair[0], pair[1]
+        donor_parsed, acceptor_parsed = parse_pair(donor_key, acceptor_key)
+        donor_chain, donor_resname, donor_resnum, donor_atomid = donor_parsed  # de-structuring
+        if donor_atomid == "N":
+            donor_valency = 1
+        else:
+            donor_valency = aa_sc_h_donor_atoms[donor_resname][donor_atomid]
+        acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid = acceptor_parsed   # de-structuring
+        if acceptor_atomid == "O":
+            acceptor_valency = 2
+        else:
+            acceptor_valency = aa_sc_h_acceptor_atoms[acceptor_resname][acceptor_atomid]
+        repeats = min([donor_valency, acceptor_valency])        # the lowest valency atom dictates number of hbonds possible
+        for i in range(repeats):
+            donor_atom = model[donor_chain][int(donor_resnum)][donor_atomid]
+            acceptor_atom = model[acceptor_chain][int(acceptor_resnum)][acceptor_atomid]
+            hbond = HBondPair(donor_atom, donor_hydrogen_atom, acceptor_atom, model_dssp)
+            donor_acceptor_list.append(hbond)
+    return donor_acceptor_list
+"""
+
+def get_poss_hbonds(donor_acceptor_set, model, model_dssp):        # get a list of viable HBondPair objects at the level of individual H atoms
+#    dha_set = set()        # data set for checking if an atom as a donor and a specific donor hydrogen and another atom as an acceptor have been considered already
+    poss_hbonds = []           # record of HBondPair objects at the level of donor-hydrogen-acceptor
+    for pair in donor_acceptor_set:
+        donor_parsed, acceptor_parsed = parse_pair(pair)
+        donor_chain, donor_resname, donor_resnum, donor_atomid = donor_parsed  # de-structuring
+        acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid = acceptor_parsed   # de-structuring
+        donor_atom = model[donor_chain][int(donor_resnum)][donor_atomid]
+        acceptor_atom = model[acceptor_chain][int(acceptor_resnum)][acceptor_atomid]
+        poss_d_h_ids = aa_res_hydrogens[donor_resname][donor_atomid]           # yield a list of hydrogen atom ids for hydrogen atoms covalently bonded with the donor atom
+        for poss_d_h_id in poss_d_h_ids:
+            donor_hydrogen_atom = donor_atom.parent[poss_d_h_id]
+            hbond = HBondPair(donor_atom, donor_hydrogen_atom, acceptor_atom, model, model_dssp)
+            poss_hbonds.append(hbond)
+    return poss_hbonds
+
+def parse_pair(pair):    # expecting 'A_THR_37_N', 'A_SER_54_OG' for example
+    donor_key, acceptor_key = pair[0], pair[1]
+    donor_els = donor_key.split("_")
+    donor_chain, donor_resname, donor_resnum, donor_atomid = donor_els  # de-structuring
+    donor_out = [donor_chain, donor_resname, donor_resnum, donor_atomid]
+    acceptor_els = acceptor_key.split("_")
+    acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid = acceptor_els   # de-structuring
+    acceptor_out = [acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid]
+    return [donor_out, acceptor_out]
+
+"""
+def get_enthalpy_order(donor_acceptor_set, model):  # assign hbonds in enthalpy rank order considerate of atom occupancy stepwise
+# Establish records
+    enthalpy_order_list = []
+    enthalpy_dict = {}
+    donor_valency_count = {}
+    donor_max_valency = {}
+    acceptor_valency_count = {}
+    acceptor_max_valency = {}
+    for pair in donor_acceptor_set:
+        donor_key, acceptor_key = pair[0], pair[1]
+        donor_parsed, acceptor_parsed = parse_pair(donor_key, acceptor_key)
+        donor_chain, donor_resname, donor_resnum, donor_atomid = donor_parsed  # de-structuring
+        if donor_key not in donor_valency_count:
+            donor_valency_count[donor_key] = 0
+            if donor_atomid == "N":
+                donor_max_valency[donor_key] = 1
+            else:
+                donor_max_valency[donor_key] = aa_sc_h_donor_atoms[donor_resname][donor_atomid]
+                
+        acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid = acceptor_parsed   # de-structuring
+        if acceptor_key not in acceptor_valency_count:
+            acceptor_valency_count[acceptor_key] = 0
+            if acceptor_atomid == "O":
+                acceptor_max_valency[acceptor_key] = 2
+            else:
+                acceptor_max_valency[acceptor_key] = aa_sc_h_acceptor_atoms[acceptor_resname][acceptor_atomid]
+        donor_atom = model[donor_chain][int(donor_resnum)][donor_atomid]
+        acceptor_atom = model[acceptor_chain][int(acceptor_resnum)][acceptor_atomid]
+        d_a_dist = np.linalg.norm(donor_atom.coord - acceptor_atom.coord)
+        enthalpy = round(abs(get_h_bond_enthalpy(donor_atom, acceptor_atom)), 4)
+
+# HANDLE CASE WHERE ENTHALPIES MIGHT TIE TO AVOID OVER-WRITING DICT ELEMENT - FIRST ENCOUNTER WILL GET PRIORITY
+        if enthalpy in enthalpy_dict:
+            enthalpy_dict[enthalpy].append(pair)
+        else:
+            enthalpy_dict[enthalpy] = [pair]        # seed array with pair
+#        enthalpy_dict[enthalpy] = pair
+    for enthalpy_key in sorted(enthalpy_dict, reverse=True):
+        for entity in enthalpy_dict[enthalpy_key]:
+#            print(enthalpy_key, entity)
+            donor_key = entity[0]
+            acceptor_key = entity[1]
+
+# Create hydrogen bond object
+            donor_parsed, acceptor_parsed = parse_pair(donor_key, acceptor_key)
+            donor_chain, donor_resname, donor_resnum, donor_atomid = donor_parsed  # de-structuring
+            acceptor_chain, acceptor_resname, acceptor_resnum, acceptor_atomid = acceptor_parsed   # de-structuring
+            donor_atom = model[donor_chain][int(donor_resnum)][donor_atomid]
+            acceptor_atom = model[acceptor_chain][int(acceptor_resnum)][acceptor_atomid]
+            h_bond = HBondPair(donor_atom, acceptor_atom)
+
+            avail_donor_slots = donor_max_valency[donor_key] - donor_valency_count[donor_key]
+            avail_acceptor_slots = acceptor_max_valency[acceptor_key] - acceptor_valency_count[acceptor_key]
+            avail_slots = min([avail_donor_slots, avail_acceptor_slots])
+            for a in range(avail_slots):
+                enthalpy_order_list.append(h_bond)
+                donor_valency_count[donor_key] += 1
+                acceptor_valency_count[acceptor_key] += 1
+#            print(entity, avail_donor_slots, avail_acceptor_slots, avail_slots)
+#    print("donor_max_valency\n", donor_max_valency)
+#    print("donor_valency_count\n", donor_valency_count)
+#    print("acceptor_max_valency_count\n", acceptor_max_valency)
+#    print("acceptor_valency_count\n", acceptor_valency_count)
+#    print("enthalpy_order_list\n", enthalpy_order_list)
+#    print("enthalpy_dict\n", enthalpy_dict)
+    return enthalpy_order_list
+"""
+
+def get_pos_charge(atom):
+    if hasattr(atom, "pka"):
+        charge = get_base_charge_from_pka(atom.pka)
+    if (atom.parent.resname + atom.name) == "LYSNZ":
+#        return 1.0
+        return charge
+    elif (atom.parent.resname == "ARG") and (atom.name in ["NE", "NH1", "NH2"]):
+#        return 1.0/3.0
+        return charge / 3.0
+    elif (atom.parent.resname == "HIS") and (atom.name in ["ND1", "NE2"]):
+#        return ((1.0/2.0) * (1.0/9.0))
+        return charge / 2.0
+    else:
+        return 0.0
+
+
+def get_neg_charge(atom):
+    if hasattr(atom, "pka"):
+        charge = get_acid_charge_from_pka(atom.pka)
+    if (atom.parent.resname == "ASP") and (atom.name in ["OD1", "OD2"]):
+#        return 1.0/2.0
+        return charge / 2.0
+    elif (atom.parent.resname == "GLU") and (atom.name in ["OE1", "OE2"]):
+#        return 1.0/2.0
+        return charge / 2.0
+    else:
+        return 0.0
+
+def get_centre_atom_objects(atom_objects):          # assuming given an array of Atom objects
+    agg_coord = np.array((0.0, 0.0, 0.0))
+    for atom in atom_objects:
+#        print("atom", atom)
+#        print(atom.coord)
+        agg_coord = np.add(agg_coord, atom.coord)
+    centre_coord = agg_coord / len(atom_objects)
+#    print("centre coord", centre_coord)
+    return centre_coord
+
+def get_centre_coord(residue, atom_names):          # assuming within the same residue with specified atom names
+#    print("residue", residue.resname, residue.id[1])
+    agg_coord = np.array((0.0, 0.0, 0.0))
+    for atom_name in atom_names:
+#        print("atom", atom_name)
+#        print(residue[atom_name].coord)
+        agg_coord = np.add(agg_coord, residue[atom_name].coord)
+    centre_coord = agg_coord / len(atom_names)
+#    print("centre coord", centre_coord)
+    return centre_coord
+
+def get_sc_aromatic_groups(residue):    # assumes Residue is HIS, PHE, TRP or TYR
+    aromatic_group_atoms = []
+    for aromatic_group in aa_res_sc_aromatics[residue.resname]:
+        group_atoms = []
+        for atom_name in aromatic_group:
+            group_atoms.append(residue[atom_name])
+        aromatic_group_atoms.append(group_atoms)
+    return aromatic_group_atoms
+
+def get_aromatic_centres(residue):
+    aromatic_centres = []
+    for ring_atom_names in aa_res_sc_aromatics[residue.resname]:
+        ring_centre = get_centre_coord(residue, ring_atom_names)
+        aromatic_centres.append(ring_centre)
+    return aromatic_centres
+
+def get_sc_pigroup_centres(residue):
+    pigroup_centres = []
+    for pigroup_atom_names in aa_res_sc_pis[residue.resname]:
+        pigroup_centre = get_centre_coord(residue, pigroup_atom_names)
+        pigroup_centres.append(pigroup_centre)
+    return pigroup_centres
+
+def get_bb_pi_group(residue):
+    bb_pi_group = []
+    try:
+        bb_pi_group.append(residue["C"])
+        bb_pi_group.append(residue["O"])
+        bb_pi_group.append(residue.parent[residue.id[1]+1]["N"])
+    except:
+#        print("a problem getting .bb_pi_group")
+        bb_pi_group = []
+    return bb_pi_group
+
+def get_sc_pigroups(residue):
+    pigroups = []
+    for pigroup in aa_res_sc_pis[residue.resname]:
+        group_atoms = []
+        for atom_name in pigroup:
+            group_atoms.append(residue[atom_name])
+        pigroups.append(group_atoms)
+    return pigroups
+
+def get_non_aromatic_sc_pigroup(residue):  # expecting only one such group - not handling aromatics including TRP
+    pigroup = []
+    for atom_name in aa_res_sc_pis[residue.resname][0]:
+        pigroup.append(residue[atom_name])
+    return pigroup
+
+def get_poss_pipis(aa_sample_space):   # expects a list of Residues with relevant attributes
+#    print(len(aa_sample_space), "\n", aa_sample_space, "\n\n")
+    seen_pipi_ids = set()
+#    seen_pipi_ids = []
+    poss_pipis = []
+    for residue in aa_sample_space:
+# CHECK SELF BB W SELF SCS
+#        if (residue.bb_pi_group != []) and (residue.sc_pigroups != []):
+        if (residue.bb_pi_group != []) and (residue.all_sc_pigroups != []):
+            sc_pigroup_index = 0
+#            for sc_pigroup in residue.sc_pigroups:
+            for sc_pigroup in residue.all_sc_pigroups:
+                seen_id1 = residue.parent.id + residue.resname + str(residue.id[1]) + "bb_" + residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index)
+                seen_id2 = residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index) + "_" + residue.parent.id + residue.resname + str(residue.id[1]) + "bb"
+                if (seen_id1 in seen_pipi_ids) or (seen_id2 in seen_pipi_ids):
+#                    print("Seen before", seen_id1, "or", seen_id2)
+#                    continue
+                    pass
+                else:
+                    vernon1_d, vernon1_atoms = get_min_vernon1(residue.bb_pi_group, sc_pigroup)
+                    if vernon1_d != None:
+                        poss_pipi = PiPiPair(residue.bb_pi_group, sc_pigroup)
+                        poss_pipis.append(poss_pipi)
+                    seen_pipi_ids.add(seen_id1)
+#                    seen_pipi_ids.append(seen_id1)
+#                    seen_pipi_ids.add(seen_id2)
+                sc_pigroup_index += 1
+
+# CHECK ALL SELF W ALL OTHER
+#        if residue.sc_pigroups == []:
+        if residue.all_sc_pigroups == []:
+            pipi_radius = 10
+        else:
+            pipi_radius = 16
+#        other_residues = ns.search(get_centre_atom_objects(list(residue.get_atoms())), pipi_radius, "R")     # restrict the search to residues with atoms within 12 A of geo centre of Residue
+        other_residues = aa_sample_space.copy()
+        other_residues.remove(residue)
+#        other_residues = [element for element in other_residues if hasattr(element, "bb_pi_group")]
+#        print(len(other_residues), "\n", other_residues, "\n\n")
+        for other_residue in other_residues:
+#            if hasattr(other_residue, "bb_pi_group"):
+            if np.linalg.norm(residue["CA"].coord - other_residue["CA"].coord) < pipi_radius:
+
+# BBres BBother
+                if (residue.bb_pi_group != []) and (other_residue.bb_pi_group != []):
+                    seen_id1 = residue.parent.id + residue.resname + str(residue.id[1]) + "bb_" + other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "bb"
+                    seen_id2 = other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "bb_" + residue.parent.id + residue.resname + str(residue.id[1]) + "bb"
+                    if (seen_id1 in seen_pipi_ids) or (seen_id2 in seen_pipi_ids):
+#                        print("Seen before", seen_id1, "or", seen_id2)
+#                        continue
+                        pass
+                    else:
+#                        print(residue.bb_pi_group, other_residue.bb_pi_group)
+                        vernon1_d, vernon1_atoms = get_min_vernon1(residue.bb_pi_group, other_residue.bb_pi_group)
+                        if vernon1_d != None:
+                            poss_pipi = PiPiPair(residue.bb_pi_group, other_residue.bb_pi_group)
+                            poss_pipis.append(poss_pipi)
+                        seen_pipi_ids.add(seen_id1)
+#                        seen_pipi_ids.append(seen_id1)
+#                        seen_pipi_ids.add(seen_id2)
+# BBres SCother
+#                if (residue.bb_pi_group != []) and (other_residue.sc_pigroups != []):
+                if (residue.bb_pi_group != []) and (other_residue.all_sc_pigroups != []):
+                    other_sc_pigroup_index = 0
+#                    for other_sc_pigroup in other_residue.sc_pigroups:
+                    for other_sc_pigroup in other_residue.all_sc_pigroups:
+                        seen_id1 = residue.parent.id + residue.resname + str(residue.id[1]) + "bb_" + other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "sc" + str(other_sc_pigroup_index)
+                        seen_id2 = other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "sc" + str(other_sc_pigroup_index) + "_" + residue.parent.id + residue.resname + str(residue.id[1]) + "bb"
+                        if (seen_id1 in seen_pipi_ids) or (seen_id2 in seen_pipi_ids):
+#                           print("Seen before", seen_id1, "or", seen_id2)
+#                            continue
+                            pass
+                        else:
+                            vernon1_d, vernon1_atoms = get_min_vernon1(residue.bb_pi_group, other_sc_pigroup)
+                            if vernon1_d != None:
+                                poss_pipi = PiPiPair(residue.bb_pi_group, other_sc_pigroup)
+                                poss_pipis.append(poss_pipi)
+                            seen_pipi_ids.add(seen_id1)
+#                            seen_pipi_ids.append(seen_id1)
+#                            seen_pipi_ids.add(seen_id2)
+                        other_sc_pigroup_index += 1
+# SCres BBother
+#                if (residue.sc_pigroups != []) and (other_residue.bb_pi_group != []):
+                if (residue.all_sc_pigroups != []) and (other_residue.bb_pi_group != []):
+                    sc_pigroup_index = 0
+#                    for sc_pigroup in residue.sc_pigroups:
+                    for sc_pigroup in residue.all_sc_pigroups:
+                        seen_id1 = residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index) + "_" + other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "bb"
+                        seen_id2 = other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "bb_" + residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index)
+                        if (seen_id1 in seen_pipi_ids) or (seen_id2 in seen_pipi_ids):
+#                            print("Seen before", seen_id1, "or", seen_id2)
+#                            continue
+                            pass
+                        else:
+                            vernon1_d, vernon1_atoms = get_min_vernon1(other_residue.bb_pi_group, sc_pigroup)
+                            if vernon1_d != None:
+                                poss_pipi = PiPiPair(other_residue.bb_pi_group, sc_pigroup)
+                                poss_pipis.append(poss_pipi)
+                            seen_pipi_ids.add(seen_id1)
+#                            seen_pipi_ids.append(seen_id1)
+#                            seen_pipi_ids.add(seen_id2)
+# SCres SCother 
+#                if (residue.sc_pigroups != []) and (other_residue.sc_pigroups != []):
+                if (residue.all_sc_pigroups != []) and (other_residue.all_sc_pigroups != []):
+                    sc_pigroup_index = 0
+#                    for sc_pigroup in residue.sc_pigroups:
+                    for sc_pigroup in residue.all_sc_pigroups:
+                        other_sc_pigroup_index = 0
+#                        for other_sc_pigroup in other_residue.sc_pigroups:
+                        for other_sc_pigroup in other_residue.all_sc_pigroups:
+                            seen_id1 = residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index) + "_" + other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "sc" + str(other_sc_pigroup_index)
+                            seen_id2 = other_residue.parent.id + other_residue.resname + str(other_residue.id[1]) + "sc" + str(other_sc_pigroup_index) + "_" + residue.parent.id + residue.resname + str(residue.id[1]) + "sc" + str(sc_pigroup_index)
+                            if (seen_id1 in seen_pipi_ids) or (seen_id2 in seen_pipi_ids):
+#                               print("Seen before", seen_id1, "or", seen_id2)
+#                                continue
+                                pass
+                            else:
+                                vernon1_d, vernon1_atoms = get_min_vernon1(sc_pigroup, other_sc_pigroup)
+                                if vernon1_d != None:
+                                    poss_pipi = PiPiPair(sc_pigroup, other_sc_pigroup)
+                                    poss_pipis.append(poss_pipi)
+                                seen_pipi_ids.add(seen_id1)
+#                                seen_pipi_ids.append(seen_id1)
+#                                seen_pipi_ids.add(seen_id2)
+                            other_sc_pigroup_index += 1
+                        sc_pigroup_index += 1
+    return poss_pipis
+
+# expects two lists of pi group Atoms
+# separate functions - more iteration (linearly) but more modular structure
+class PiPiPair:
+    def __init__(self, group1, group2):
+        self.group1 = group1
+        self.group2 = group2
+        self.min_vernon1_d, self.min_vernon1_atoms = get_min_vernon1(group1, group2)  # min distance for pairs of pairs under condition that both are within 4.9 Angstroms - None if not satisfied
+        self.min_vernon2_d, self.min_vernon2_atoms = get_min_vernon2(group1, group2)      # min distance of surfaces based on points 1.7A (C VdW radius) along normal vectors from heavy atoms
+        self.vernon3 = get_vernon3(group1, group2)      # absolute value of dot product between normalized cross products from two pi groups - a measure of parallelity
+        self.pipi_centre = get_pipi_centre(group1, group2)      # define to be mean of group means
+        self.pipi_score = self.vernon3 / (self.min_vernon2_d ** 4)      # DP ad-hoc score acknowledging that being more parallel is good and surfaces nearer is good - borrowing from cation-pi system re distance relationship
+
+def get_pipi_centre(group1, group2):    # expecting each parameter to be a list of Atom objects
+    centre_coord1 = get_centre_atom_objects(group1)
+    centre_coord2 = get_centre_atom_objects(group2)
+    pipi_centre_coord = get_average_coord([centre_coord1, centre_coord2])
+    return pipi_centre_coord
+
+def get_vernon3(group1, group2):    # expecting two lists of Atoms pertaining to pi groups
+    g11, g12, g13 = group1[0], group1[1], group1[2]
+    g21, g22, g23 = group2[0], group2[1], group2[2]
+    cross1 = np.cross((g12.coord - g11.coord), (g13.coord - g11.coord))
+    norm_cross1 = (cross1 / np.linalg.norm(cross1))
+    cross2 = np.cross((g22.coord - g21.coord), (g23.coord - g21.coord))
+    norm_cross2 = (cross2 / np.linalg.norm(cross2))
+    abs_dot_norm_cross12 = abs(np.dot(norm_cross1, norm_cross2))
+    return abs_dot_norm_cross12
+
+
+class CatAromaticPiPair:
+    def __init__(self, cat_atom, aromatic_group):
+        self.cat_atom = cat_atom
+        self.aromatic_group = aromatic_group
+        self.aromatic_centre = get_centre_atom_objects(aromatic_group)
+        self.cat_aromatic_d = np.linalg.norm(cat_atom.coord - self.aromatic_centre)
+        self.pair_centre = get_average_coord([cat_atom.coord, self.aromatic_centre])
+        self.cat_aromatic_score = (cat_atom.pos_charge / (self.cat_aromatic_d ** 4))
+
+class CatNonaromaticPiPair:
+    def __init__(self, cat_atom, pigroup):
+        self.cat_atom = cat_atom
+        self.non_aromatic_pi_group = pigroup
+        self.non_aromatic_pi_centre = get_centre_atom_objects(pigroup)
+        self.cat_non_aromatic_pi_d = np.linalg.norm(cat_atom.coord - self.non_aromatic_pi_centre)
+        self.pair_centre = get_average_coord([cat_atom.coord, self.non_aromatic_pi_centre])
+        self.cat_non_aromatic_pi_score = (cat_atom.pos_charge / (self.cat_non_aromatic_pi_d ** 4))
+        
+
+
+def get_min_vernon2(group1, group2):    # expecting two lists of Atoms pertaining to pi groups
+# return the shortest distance of pair-mins for 1.7Angstroms cross product projections from heavy atoms projected in either direction
+# also return the pairs of Atoms (Atom1, Atom2)
+    pi_pair_atoms = []
+    pi_pair_surface_distances = []
+    for atom1 in group1:
+        other_group1s = group1.copy()          # make a copy, remove atom and take the first two elements
+        other_group1s.remove(atom1)
+        two_other_group1s = other_group1s[:2]          # make a copy, remove atom and take the first two elements
+        cross1 = np.cross((two_other_group1s[0].coord - atom1.coord), (two_other_group1s[1].coord - atom1.coord))
+        adj_cross1 = (cross1 / np.linalg.norm(cross1)) * 1.7
+        poss_atom1_surfaces = [(atom1.coord + adj_cross1), (atom1.coord - adj_cross1)]
+        for atom2 in group2:
+            other_group2s = group2.copy()          # make a copy, remove atom and take the first two elements
+            other_group2s.remove(atom2)
+            two_other_group2s = other_group2s[:2]          # make a copy, remove atom and take the first two elements
+#            two_other_group2s = group2.copy().remove(atom2)[:2]          # make a copy, remove atom and take the first two elements
+            cross2 = np.cross((two_other_group2s[0].coord - atom2.coord), (two_other_group2s[1].coord - atom2.coord))
+            adj_cross2 = (cross2 / np.linalg.norm(cross2)) * 1.7
+            poss_atom2_surfaces = [(atom2.coord + adj_cross2), (atom2.coord - adj_cross2)]
+            poss_cross_distances = []
+            for coord1 in poss_atom1_surfaces:
+                for coord2 in poss_atom2_surfaces:
+                    poss_cross_distances.append(np.linalg.norm(coord1 - coord2))
+            pi_pair_surface_distances.append(min(poss_cross_distances))
+            pi_pair_atoms.append((atom1, atom2))
+    index_min = np.argmin(pi_pair_surface_distances)
+    return pi_pair_surface_distances[index_min], pi_pair_atoms[index_min]
+            
+          
+def get_min_vernon1(group1, group2):    # expecting two lists of Atoms pertaining to pi groups
+# return the shortest distance of pair-pair-mins across valid candidate pairs of pairs - i.e. both pairs within 4.9 Angstroms
+# also return the pairs of pairs ((Atom1a, Atom1b), (Atom2a, Atom2b))
+    group1_centre = get_centre_atom_objects(group1)
+    group2_centre = get_centre_atom_objects(group2)
+    if np.linalg.norm(group1_centre - group2_centre) > 8:       # check for viability before proceeding with deeper iteration
+        return None, None
+    else:
+        pass
+    group1_pair_permutations = list(itertools.permutations(group1, 2))
+    group2_pair_combinations = list(itertools.combinations(group2, 2))
+    pi_pairs_record = []
+#    pi_pairs_agg_distances = []
+    pi_pairs_min_distances = []
+    for group1_pair in group1_pair_permutations:
+        for group2_pair in group2_pair_combinations:
+            d1 = np.linalg.norm(group1_pair[0].coord - group2_pair[0].coord)
+            d2 = np.linalg.norm(group1_pair[1].coord - group2_pair[1].coord)
+            if (d1 <= 4.9) and (d2 <= 4.9):
+                pi_pairs_record.append((group1_pair, group2_pair))
+#                pi_pairs_agg_distances.append(d1 + d2)
+                pi_pairs_min_distances.append(min([d1, d2]))
+    if pi_pairs_record != []:
+        index_min = np.argmin(pi_pairs_min_distances)
+        return pi_pairs_min_distances[index_min], pi_pairs_record[index_min]
+    else:
+        return None, None
+
+
+def get_depth_eff(atom):
+# from Xu et al 2013 depth surface area relationship as inspiration
+# -tln((rd-y)/A) = sa yielded by manipulation of Xu et al exponential function - however, ln is constrained in useful range
+# P4 logistic curve seems intuitive to capture change in Eff with depth
+# how might we empirically show this to be appropriate or not?
+#    rd = min_dist(atom.coord, model_surface)
+#    print("y A t rd", y, A, t, rd)
+#    if rd > y:
+#        sa = -(t * (np.log((rd - y) / A)))     # [0, 1]
+#        if sa < 0:      # must be in range [0, 1]
+#            sa = 0.0
+#    else:
+#        sa = 1.0
+#    print("sa:", sa)
+#    eff = 4 + (76 * sa)
+    a = 4       # lower bound
+    b = 80      # upper bound
+    c = 3       # rate parameter
+    d = 3       # inflection offset parameter
+#    eff = a + ((b - a) / (1 + np.exp(c * (rd - d))))
+    eff = a + ((b - a) / (1 + np.exp(c * (atom.depth - d))))
+    atom.eff = eff
+#    print("atom depth:", rd)
+#    print("atom depth:", atom.depth)
+#    print("eff:", eff)
+    return eff
+
+    
+
+
+def get_coulombic_score(attraction, atom1, atom2):
+# based on Lee et al 2012
+# G = 332 z / Eff (1 / (r * e^Kr))
+# r is distance from atom1 to atom2
+# K = 50.3 (I / (Eh2o * T))^1/2
+# Eff is effective dielectric constant - ranges widely in proteins e.g. 4-80
+# Eh20 is effective dielectric constant in water = 78.5
+# T is in Kelvin
+# I is ionic strength (M) 
+# let us assume T = 298K and let us assume I = 0.2 M - yields K = 0.147
+    r = np.linalg.norm(atom1.coord - atom2.coord)
+    K = 0.147
+#    eff = 20    # placeholder static value for protein environment dielectric constant - revisit this
+#    print("atom1")
+    eff_atom1 = get_depth_eff(atom1)
+#    print("atom2")
+    eff_atom2 = get_depth_eff(atom2)
+    eff_max = max([eff_atom1, eff_atom2])
+#    print("eff max:", eff_max)
+    g = ((332 * attraction) / (eff_max)) * ( 1 / (r * np.exp(K * r)))
+#    print("g:", g)
+    return g
+
+
+class CoulombPair:
+    def __init__(self, charge_attraction, atom1, atom2):
+        self.atom1 = atom1
+        self.atom2 = atom2
+        self.pair_dist = np.linalg.norm(atom1.coord - atom2.coord)
+        self.charge_attraction = charge_attraction
+        self.coulombic_score = get_coulombic_score(charge_attraction, atom1, atom2)
+        self.eff_max = max([atom1.eff, atom2.eff])
+        self.mid_point = get_centre_atom_objects([atom1, atom2])
+
+
+
+# NOTE - have the option of using hydrogen atom geometry for scoring somehow
+
+# JUMP IN HERE TO CREATE SEPARATE FUNCTIONS FOR WILD TYPE AND MUTANT TENSOR - WITH A VIEW TO SUBTRACTING OR COMBINING AFTER...
+# MMCIFPARSER.GET_STRUCTURE USES PDB_ID just as an id for the structure object created methinks
+
+def make_structure_tensor(struct_id, filepath, pka_file, chain, res_num, num_row_voxels, voxel_edge, channels):
+    c_num = len(channels)
+    ch_indices = get_channel_indices(channels)
+    pka_dict = get_pkas(pka_file)
+    print(pka_dict)
+    structure = get_structure_object(struct_id, filepath)
+    model = list(structure.get_models())[0]
+#    model_dssp = DSSP(model, cif_file, dssp="mkdssp", acc_array="Sander")    # for RSA calc select from Miller, Sander, Wilke
+    model_dssp = DSSP(model, filepath, dssp="mkdssp", acc_array="Sander")    # for RSA calc select from Miller, Sander, Wilke
+    model_surface = get_surface(model, MSMS='msms.x86_64Darwin.2.6.1')
+    sample_xyzc_tensor = make_tensor_record(num_row_voxels, num_row_voxels, num_row_voxels, c_num)  # nested list - set these dimensions to taste - xyzc - expect odd xyz
+    sample_xyzc_nparray = np.asarray(sample_xyzc_tensor, dtype = np.float64)
+
+    sampling_radius = get_sampling_radius((voxel_edge * num_row_voxels))    # provide intended length of tensor grid edge
+    ns = NeighborSearch(list(model.get_atoms()))
+    sample_space = ns.search(model[chain][res_num]["CA"].coord, sampling_radius, "R")       # list of residue objects at least overlapping within sampling radius of centre atom coord
+    aa_sample_space = get_aa_residues(sample_space)
+
+#    residue_groups = ns.search_all(5, "R")      # residues within 5 Angstroms of each other
+#    print("residue_groups")
+#    print(residue_groups)
+
+    donor_acceptor_set = set()        # data set for checking if an atom as a donor and another atom as an acceptor have been considered already
+    aromatic_residues = []
+    aromatic_groups = []
+#    all_pi_groups = []
+    non_aromatic_pi_groups = []
+    non_polar_heavy_atoms = []
+    polar_or_charged_heavy_atoms = []
+    cationic_atoms = []
+    anionic_atoms = []
+
+    for residue in sample_space:
+        if is_aa(residue):
+
+            if "aromatic" in channels:
+                residue.aromatic_groups = []
+                residue.aromatic_centres = []
+                if residue.resname in ["HIS", "PHE", "TRP", "TYR"]:     # note - TRP has two aromatic rings
+                    residue.aromatic_groups = get_sc_aromatic_groups(residue)
+                    residue.aromatic_centres = get_aromatic_centres(residue)
+                    aromatic_residues.append(residue)
+                    for aromatic_group in residue.aromatic_groups:
+                        aromatic_groups.append(aromatic_group)
+                    for aromatic_centre in residue.aromatic_centres:
+                        if is_coord_in_tensor(aromatic_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                            x, y, z = get_xyz_indices(aromatic_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                            sample_xyzc_nparray[x][y][z][ch_indices["aromatic"]] += 1
+
+            if "non_aromatic_pi" in channels:
+                residue.bb_pi_group = []
+                residue.bb_pi_centre = None
+                residue.sc_pigroups = []
+                residue.sc_pigroup_centres = []
+#                try:
+                    # residue and +1 N
+                residue.bb_pi_group = get_bb_pi_group(residue)
+                if residue.bb_pi_group != []:
+                    non_aromatic_pi_groups.append(residue.bb_pi_group)
+                    residue.bb_pi_centre = get_centre_atom_objects(residue.bb_pi_group)
+                    if is_coord_in_tensor(residue.bb_pi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                        x, y, z = get_xyz_indices(residue.bb_pi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#                        print("added bb_pi_centre to tensor")
+#                        sample_xyzc_nparray[x][y][z][ch_indices["pi"]] += 1
+                        sample_xyzc_nparray[x][y][z][ch_indices["non_aromatic_pi"]] += 1
+#                except:
+#                    print("PLOPPERS - couldn't process all backbone peptide pi heavy atoms")
+#                    pass
+                if residue.resname in ["HIS", "PHE", "TRP", "TYR", "ASP", "GLU", "ARG", "ASN", "GLN"]:     # note - TRP has two aromatic rings
+                    residue.sc_pigroups = get_sc_pigroups(residue) 
+                    residue.sc_pigroup_centres = get_sc_pigroup_centres(residue)
+                if residue.resname in ["ASP", "GLU", "ARG", "ASN", "GLN"]:     # residues with non-aromatic sidechain pi groups
+                    residue.non_aromatic_sc_pigroup = get_non_aromatic_sc_pigroup(residue)
+                    non_aromatic_pi_groups.append(residue.non_aromatic_sc_pigroup)
+                    residue.non_aromatic_sc_pi_centre = get_centre_atom_objects(residue.non_aromatic_sc_pigroup)
+                    if is_coord_in_tensor(residue.non_aromatic_sc_pi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                        x, y, z = get_xyz_indices(residue.non_aromatic_sc_pi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                        sample_xyzc_nparray[x][y][z][ch_indices["non_aromatic_pi"]] += 1
+                    # JUMP IN HERE TO add peptide bond stuff
+                    
+#                print("\n\n")
+#                print("resname", residue.resname)
+#                print("aromatic_groups", residue.aromatic_groups)
+#                print("aromatic_centres", residue.aromatic_centres)
+#                print("bb_pi_group", residue.bb_pi_group)
+#                print("bb_pi_centre", residue.bb_pi_centre)
+#                print("sc_pigroups", residue.sc_pigroups)
+#                print("sc_pigroup_centres", residue.sc_pigroup_centres)
+
+            atoms = residue.get_atoms()
+            for atom in atoms:
+                atom.depth = min_dist(atom.coord, model_surface)
+                res_key = atom.parent.parent.id + atom.parent.resname + str(atom.parent.id[1])
+                if res_key in pka_dict:
+                    atom.pka = pka_dict[res_key]
+                if is_coord_in_tensor(atom.coord, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+#                    print(atom.name, atom.coord, "is within tensor with centre", model[chain][res_num]["CA"].coord, "diff", atom.coord - model[chain][res_num]["CA"].coord)
+                    x, y, z = get_xyz_indices(atom.coord, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                    if "nonpolar_heavy" in channels:
+                        if atom.name in aa_res_nonpolar_heavy_atoms[atom.parent.resname]:
+                            sample_xyzc_nparray[x][y][z][ch_indices["nonpolar_heavy"]] += 1
+                            non_polar_heavy_atoms.append(atom)
+                    if "polar_or_charged_heavy" in channels:
+                        if (atom.name not in aa_res_nonpolar_heavy_atoms[atom.parent.resname]) and (atom.element != "H"):
+                            sample_xyzc_nparray[x][y][z][ch_indices["polar_or_charged_heavy"]] += 1
+                            polar_or_charged_heavy_atoms.append(atom)
+                        
+
+
+                    if "pos_charge" in channels:
+#                        atom.pos_charge = get_pos_charge(atom)
+                        atom.pos_charge = get_pos_charge(atom)
+                        if atom.pos_charge > 0.0:
+                            cationic_atoms.append(atom)
+#                            print("cationic atom:", atom.parent.parent.id, atom.parent.resname, atom.parent.id[1], atom.name, atom.pka, atom.pos_charge)
+                        sample_xyzc_nparray[x][y][z][ch_indices["pos_charge"]] += atom.pos_charge
+                    if "neg_charge" in channels:
+#                        atom.neg_charge = get_neg_charge(atom)
+                        atom.neg_charge = get_neg_charge(atom)
+                        if atom.neg_charge > 0.0:
+                            anionic_atoms.append(atom)
+#                            print("anionic atom:", atom.parent.parent.id, atom.parent.resname, atom.parent.id[1], atom.name, atom.pka, atom.neg_charge)
+                        sample_xyzc_nparray[x][y][z][ch_indices["neg_charge"]] += atom.neg_charge
+                        
+
+
+                    if atom.element == "N":
+                        if "n_channel" in channels:
+                            sample_xyzc_nparray[x][y][z][ch_indices["n_channel"]] += 1
+                    elif atom.element == "C":
+                        if "c_channel" in channels:
+                            sample_xyzc_nparray[x][y][z][ch_indices["c_channel"]] += 1
+                    elif atom.element == "O":
+                        if "o_channel" in channels:
+                            sample_xyzc_nparray[x][y][z][ch_indices["o_channel"]] += 1
+                    elif atom.element == "S":
+                        if "s_channel" in channels:
+                            sample_xyzc_nparray[x][y][z][ch_indices["s_channel"]] += 1
+                    elif atom.element == "H":
+                        if "h_channel" in channels:
+                            sample_xyzc_nparray[x][y][z][ch_indices["h_channel"]] += 1
+                    else:
+                        continue            # NOTE - THIS WILL SKIP CONSIDERATION OF HBONDS ETC AND SKIP TO NEXT ATOM IF NOT N C O S
+                    donor_acceptor_set = get_poss_das(atom, ns, donor_acceptor_set)
+
+                else:
+#                    print(atom.name, atom.coord, "is NOT within tensor with centre", model[chain][res_num]["CA"].coord, "diff", atom.coord - model[chain][res_num]["CA"].coord)
+                    continue
+
+#    for aromatic_residue in aromatic_residues:
+#        for aromatic_group in aromatic_residue.aromatic_groups:
+#            aromatic_groups.append(aromatic_group)
+
+#    for residue in sample_space:
+#        if residue.bb_pi_group != []:
+#            all_pi_groups.append(residue.bb_pi_group)
+#            non_aromatic_pi_groups.append(residue.bb_pi_group)
+#        if residue.sc_pigroups != []:
+#            for pigroup in residue.sc_pigroups:
+#                all_pi_groups.append(pigroup)
+#            if residue.resname not in ["HIS", "TYR", "TRP", "PHE"]:
+#                for pigroup in residue.sc_pigroups:
+#                    non_aromatic_pi_groups.append(pigroup)
+    print("number of nonpolar heavy atoms", len(non_polar_heavy_atoms))
+    print("number of polar or charged heavy atoms", len(polar_or_charged_heavy_atoms))
+    print("number of anionic atoms", len(anionic_atoms))
+    print("number of cationic atoms", len(cationic_atoms))
+    print("number of aromatic residues", len(aromatic_residues))
+    print("number of aromatic groups", len(aromatic_groups))
+    print("number of non-aromatic pi groups", len(non_aromatic_pi_groups))
+
+# the above created a collapsed set (not considering valency) of candidate hydrogen bond partners at the level of donor and acceptor atoms - as donor, acceptor key tuples
+# these satisfied donor-acceptor distance between 2 and 3.5 Angstroms and h hat angle between 90o and 180o
+# below - we will create a collapsed set of hydrogen bond partners at the level of donor, specific hydrogen and acceptor atoms - as HBondPair objects with H-aware enthalpy
+    if ("hbond_mm_enthalpy" in channels) or ("hbond_kortemme_energy" in channels):
+        poss_hbonds = get_poss_hbonds(donor_acceptor_set, model, model_dssp)        # yields a list of candidate HBondPair objects at the individual donor hydrogen level
+        print("number of poss_hbonds")
+        print(len(poss_hbonds))
+        for poss_hbond in poss_hbonds:
+#            print("CANDIDATE HBondPair", "\n",
+#              "-------------------", "\n",
+#              "donor_hydrogen_atom:", poss_hbond.donor_hydrogen_atom.id, "\n",
+#              "donor_atom:", poss_hbond.donor_atom, "\n",
+#              "donor_dssp_ss", poss_hbond.donor_dssp_ss, "\n",
+#              "donor_dssp_ss_simple", poss_hbond.donor_dssp_ss_simple, "\n",
+#              "acceptor_atom", poss_hbond.acceptor_atom, "\n",
+#              "acceptor_residue", poss_hbond.acceptor_atom.parent, "\n",
+#              "acceptor_dssp_ss", poss_hbond.acceptor_dssp_ss, "\n",
+#              "acceptor_dssp_ss_simple", poss_hbond.acceptor_dssp_ss_simple, "\n",
+#              "acceptor_prime", poss_hbond.acceptor_prime, "\n",
+#              "da_distance", poss_hbond.da_distance, "\n",
+#              "h_hat_angle", poss_hbond.h_hat_angle, "\n",
+#              "mm_enthalpy", poss_hbond.mm_enthalpy, "\n",
+#              "da_centre", poss_hbond.da_centre, "\n",
+#              "ha_centre", poss_hbond.ha_centre, "\n",
+#              "ha_distance", poss_hbond.ha_distance, "\n",
+#              "ha_energy", poss_hbond.ha_energy, "\n",
+#              "aah_angle_degrees", poss_hbond.aah_angle_degrees, "\n",
+#              "aah_energy", poss_hbond.aah_energy, "\n",
+#              "ahd_angle_degrees", poss_hbond.ahd_angle_degrees, "\n",
+#              "ahd_energy", poss_hbond.ahd_energy, "\n",
+#              "h_dihedral_angle_degrees", poss_hbond.h_dihedral, "\n",
+#              "h_dihedral_energy", poss_hbond.h_dihedral_energy, "\n",
+#              "mm_enthalpy", poss_hbond.mm_enthalpy, "\n",
+#              "kortemme_energy", poss_hbond.kortemme_energy, "\n"
+#             )
+
+            if is_coord_in_tensor(poss_hbond.ha_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                x, y, z = get_xyz_indices(poss_hbond.ha_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                if "hbond_mm_enthalpy" in channels:
+                    sample_xyzc_nparray[x][y][z][ch_indices["hbond_mm_enthalpy"]] += poss_hbond.mm_enthalpy
+#                    print("ADDED hbond_mm_enthalpy", poss_hbond.ha_centre, poss_hbond.mm_enthalpy,"\n")
+                if ("hbond_kortemme_energy" in channels) and (poss_hbond.kortemme_energy != None):
+                    sample_xyzc_nparray[x][y][z][ch_indices["hbond_kortemme_energy"]] += poss_hbond.kortemme_energy
+#                    print("ADDED hbond_kortemme_energy", poss_hbond.ha_centre, poss_hbond.kortemme_energy,"\n")
+
+    if "depth" in channels:
+        centre_coords = get_voxel_centre_coords(model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)        # intended e.g. to obtain representative depth measure at centre of voxel
+#        print("DEPTH")
+#        print("centre residue alpha carbon", model[chain][res_num]["CA"].coord)
+        for centre_coord in centre_coords:
+#            print(centre_coord)
+            x, y, z = get_xyz_indices(centre_coord, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+            coord_depth = min_dist(centre_coord, model_surface)
+#            print(coord_depth)
+            sample_xyzc_nparray[x][y][z][ch_indices["depth"]] = coord_depth
+ 
+    if "pipi" in channels:
+#        poss_pipis = get_poss_pipis(sample_space)
+        poss_pipis = get_poss_pipis(aa_sample_space)
+        pipis = []
+#        print("number of poss_pipis")
+#        print(len(poss_pipis))
+        for poss_pipi in poss_pipis:
+            if (poss_pipi.min_vernon2_d <= 1.1) and (poss_pipi.vernon3 >= 0.8):
+                if is_coord_in_tensor(poss_pipi.pipi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                    pipis.append(poss_pipi)
+                    x, y, z = get_xyz_indices(poss_pipi.pipi_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#                    sample_xyzc_nparray[x][y][z][ch_indices["pipi"]] += 1.0
+                    sample_xyzc_nparray[x][y][z][ch_indices["pipi"]] += poss_pipi.pipi_score
+        pipis.sort(key=attrgetter("pipi_score"), reverse=True)
+#                    print(poss_pipi.group1[0].parent.resname, poss_pipi.group1[0].parent.id[1])
+#                    print(poss_pipi.group1)
+#                    print(poss_pipi.group2[0].parent.resname, poss_pipi.group2[0].parent.id[1])
+#                    print(poss_pipi.group2)
+#                    print(poss_pipi.min_vernon1_d)
+#                    print(poss_pipi.min_vernon1_atoms)
+#                    print(poss_pipi.min_vernon2_d)
+#                    print(poss_pipi.min_vernon2_atoms)
+#                    print(poss_pipi.vernon3)
+#                    print(poss_pipi.pipi_centre)
+#                    print(poss_pipi.pipi_score)
+#                    print("\n")
+#        print("number of pass pipis in tensor:", len(pipis), "\n")
+        print("number of pipi pairs:", len(pipis))
+#        print("PIPIS")
+#        for pipi in pipis:
+#            print(pipi.group1[1].parent.resname, pipi.group1[1].parent.id[1], pipi.group2[1].parent.resname, pipi.group2[1].parent.id[1])
+#            print("score:", pipi.pipi_score, "surfaces distance:", pipi.min_vernon2_d, "parallel:", pipi.vernon3)
+
+    if "cation_aromatic" in channels:
+        cat_aromatics = []
+        for cat_atom in cationic_atoms:
+#            if cat_atom.parent.resname != "HIS":       # case where we only consider ARG and LYS but not HIS residues
+            for aromatic_group in aromatic_groups:      # note that both aromatic groups in tryptophan are considered independently
+                if (cat_atom.parent.parent.id, cat_atom.parent.id) != (aromatic_group[1].parent.parent.id, aromatic_group[1].parent.id):   # exclude the case where cation and aromatic are in the same residue - HIS
+                    cat_aromatic_pair = CatAromaticPiPair(cat_atom, aromatic_group)
+                    cat_aromatics.append(cat_aromatic_pair)
+                    if is_coord_in_tensor(cat_aromatic_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                        x, y, z = get_xyz_indices(cat_aromatic_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                        sample_xyzc_nparray[x][y][z][ch_indices["cation_aromatic"]] += cat_aromatic_pair.cat_aromatic_score
+        cat_aromatics.sort(key=attrgetter("cat_aromatic_score"), reverse=True)
+        print("number of cat-aromatic pairs", len(cat_aromatics))
+#            for aromatic_res in aromatic_residues:
+#                if aromatic_res.id != cat_atom.parent.id:   # exclude the case where cation and aromatic are in the same residue - HIS
+#                    for aromatic_group in aromatic_res.aromatic_groups:      # note that both aromatic groups in tryptophan are considered independently
+#                        cat_aromatic_pair = CatAromaticPair(cat_atom, aromatic_group)
+#                        cat_aromatics.append(cat_aromatic_pair)
+#                        if is_coord_in_tensor(cat_aromatic_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+#                            x, y, z = get_xyz_indices(cat_aromatic_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#                            sample_xyzc_nparray[x][y][z][ch_indices["cation_aromatic"]] += cat_aromatic_pair.cat_aromatic_score
+
+
+    if "cation_non_aromatic_pi" in channels:
+        cat_non_aromatic_pis = []
+        for cat_atom in cationic_atoms:
+#            if cat_atom.parent.resname != "HIS":       # case where we only consider ARG and LYS but not HIS residues
+            for pigroup in non_aromatic_pi_groups:
+                if (cat_atom.parent.parent.id, cat_atom.parent.id) != (pigroup[1].parent.parent.id, pigroup[1].parent.id):   # exclude the case where cation and nonaromatic pi are in the same residue - ARG
+                    cat_non_aromatic_pi_pair = CatNonaromaticPiPair(cat_atom, pigroup)
+                    cat_non_aromatic_pis.append(cat_non_aromatic_pi_pair)
+                    if is_coord_in_tensor(cat_non_aromatic_pi_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                        x, y, z = get_xyz_indices(cat_non_aromatic_pi_pair.pair_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                        sample_xyzc_nparray[x][y][z][ch_indices["cation_non_aromatic_pi"]] += cat_non_aromatic_pi_pair.cat_non_aromatic_pi_score
+        cat_non_aromatic_pis.sort(key=attrgetter("cat_non_aromatic_pi_score"), reverse=True)
+        print("number of cat-non-aromatic pis", len(cat_non_aromatic_pis))
+
+#        print("CAT-NONAROMATIC-PIS")
+#        for catpi in cat_non_aromatic_pis:
+#            print(catpi.cat_atom.parent.resname, str(catpi.cat_atom.parent.id[1]), catpi.non_aromatic_pi_group[1].parent.resname, str(catpi.non_aromatic_pi_group[1].parent.id[1]), catpi.non_aromatic_pi_group)
+#            print("score:", catpi.cat_non_aromatic_pi_score, "cat-pi distance:", catpi.cat_non_aromatic_pi_d, "cat charge:", catpi.cat_atom.pos_charge)
+
+
+#            for pigroup in non_aromatic_pi_groups:
+#                if pigroup[1].parent.id != cat_atom.parent.id:
+#                    if np.linalg.norm(cat_atom.coord - pigroup[1].parent["CA"].coord) < 20:      # are the cation and residue within plausible distance?
+#                        pi_centre = get_centre_atom_objects(pigroup)
+#                        cat_pi_d = np.linalg.norm(cat_atom.coord - pi_centre)
+#                            print(cat_aromatic_d, cat_atom.parent.resname, cat_atom.parent.id[1], aromatic_group[0].parent.resname, aromatic_group[0].parent.id[1])
+#                        if cat_pi_d < 10:     # applying a further distance check - this time cation atom to the centre of the pi group in question
+#                            cat_non_aromatic_pi = CatNonaromaticPiPair(cat_atom, pigroup)
+#                            cat_non_aromatic_pis.append(cat_non_aromatic_pi)
+#                            cat_non_aromatic_pi_score = (cat_atom.pos_charge / (cat_pi_d ** 4))
+#                            print(cat_atom.parent.resname, cat_atom.parent.id[1], pigroup[1].parent.resname, pigroup[1].parent.id[1], pigroup, "cat_non_aromatic_pi_d", cat_pi_d, "cat_non_aromatic_pi_score", cat_non_aromatic_pi_score)
+#                            cat_non_aromatic_pi_coord = get_average_coord([cat_atom.coord, pi_centre])
+#                            if is_coord_in_tensor(cat_non_aromatic_pi_coord, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+#                                x, y, z = get_xyz_indices(cat_non_aromatic_pi_coord, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#                                sample_xyzc_nparray[x][y][z][ch_indices["cation_non_aromatic_pi"]] += cat_non_aromatic_pi_score
+#                    else:
+#                        print(cat_atom, "is too far from aromatic residue CA - do not process further")
+#                        pass
+#                else:
+#                    print(cat_atom, "is within", aromatic_res, "- do not process further")
+#                    pass                             
+
+    if "coulombic" in channels:
+        coulomb_pairs = []
+        for cat_atom in cationic_atoms:
+# check against other cat_atoms and anions
+            cat_atom_id = cat_atom.parent.parent.id + cat_atom.parent.resname + str(cat_atom.parent.id[1]) + cat_atom.name
+            cat_res_id = cat_atom.parent.parent.id + cat_atom.parent.resname + str(cat_atom.parent.id[1])
+            for an_atom in anionic_atoms:
+                an_atom_id = an_atom.parent.parent.id + an_atom.parent.resname + str(an_atom.parent.id[1]) + an_atom.name
+                an_res_id = an_atom.parent.parent.id + an_atom.parent.resname + str(an_atom.parent.id[1])
+                charge_attraction = (cat_atom.pos_charge * an_atom.neg_charge)
+#                print(cat_atom_id, an_atom_id, "charge_ATTRACTION", charge_attraction)
+#                coulombic_score = get_coulombic_score(charge_attraction, cat_atom, an_atom, model_surface)
+#                coulombic_score = get_coulombic_score(charge_attraction, cat_atom, an_atom)
+#                print("coulombic score:", coulombic_score, "r:", np.linalg.norm(cat_atom.coord - an_atom.coord), "charge_attraction:", charge_attraction, "\n")
+                coulomb_pair = CoulombPair(charge_attraction, cat_atom, an_atom)
+                coulomb_pairs.append(coulomb_pair)
+
+
+                pass
+            for other_cat_atom in cationic_atoms:
+                other_cat_atom_id = other_cat_atom.parent.parent.id + other_cat_atom.parent.resname + str(other_cat_atom.parent.id[1]) + other_cat_atom.name
+                other_cat_res_id = other_cat_atom.parent.parent.id + other_cat_atom.parent.resname + str(other_cat_atom.parent.id[1])
+#                if cat_atom_id != other_cat_atom_id:        # exclude the case where an atom is being assessed against itself
+                if cat_res_id != other_cat_res_id:        # exclude the case where an atom is being assessed against an atom from the same residue
+                    charge_attraction = -(cat_atom.pos_charge * other_cat_atom.pos_charge)
+#                    print(cat_atom_id, other_cat_atom_id, "charge_REPULSION", charge_attraction)
+#                    coulombic_score = get_coulombic_score(charge_attraction, cat_atom, other_cat_atom, model_surface)
+#                    coulombic_score = get_coulombic_score(charge_attraction, cat_atom, other_cat_atom)
+#                    print("coulombic score:", coulombic_score, "r:", np.linalg.norm(cat_atom.coord - other_cat_atom.coord), "charge_attraction:", charge_attraction, "\n")
+                    coulomb_pair = CoulombPair(charge_attraction, cat_atom, other_cat_atom)
+                    coulomb_pairs.append(coulomb_pair)
+                    pass
+                else:
+ #                   print(cat_atom_id, other_cat_atom_id, "indicate same cationic residue - do not process further", "\n")
+                    pass
+
+        for an_atom in anionic_atoms:
+            an_atom_id = an_atom.parent.parent.id + an_atom.parent.resname + str(an_atom.parent.id[1]) + an_atom.name
+            an_res_id = an_atom.parent.parent.id + an_atom.parent.resname + str(an_atom.parent.id[1])
+# check against other anions - already checked against cations in above iteration
+            for other_an_atom in anionic_atoms:
+                other_an_atom_id = other_an_atom.parent.parent.id + other_an_atom.parent.resname + str(other_an_atom.parent.id[1]) + other_an_atom.name
+                other_an_res_id = other_an_atom.parent.parent.id + other_an_atom.parent.resname + str(other_an_atom.parent.id[1])
+#                if an_atom_id != other_an_atom_id:        # exclude the case where an atom is being assessed against itself
+                if an_res_id != other_an_res_id:        # exclude the case where an atom is being assessed against an atom from the same residue
+                    charge_attraction = -(an_atom.neg_charge * other_an_atom.neg_charge)
+#                    print(an_atom_id, other_an_atom_id, "charge_REPULSION", charge_attraction)
+#                    coulombic_score = get_coulombic_score(charge_attraction, an_atom, other_an_atom, model_surface)
+#                    coulombic_score = get_coulombic_score(charge_attraction, an_atom, other_an_atom)
+#                    print("coulombic score:", coulombic_score, "r:", np.linalg.norm(an_atom.coord - other_an_atom.coord), "charge_attraction:", charge_attraction, "\n")
+                    coulomb_pair = CoulombPair(charge_attraction, an_atom, other_an_atom)
+                    coulomb_pairs.append(coulomb_pair)
+                    pass
+                else:
+#                    print(an_atom_id, other_an_atom_id, "indicate same anionic residue - do not process further", "\n")
+                    pass
+        coulomb_pairs.sort(key=attrgetter("coulombic_score"), reverse=True)
+        print("number of coulombic pairs", len(coulomb_pairs))
+
+        
+#        print(len(coulomb_pairs), "\n")
+        for pair in coulomb_pairs:
+            if is_coord_in_tensor(pair.mid_point, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+                x, y, z = get_xyz_indices(pair.mid_point, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+                sample_xyzc_nparray[x][y][z][ch_indices["coulombic"]] += pair.coulombic_score
+#            print(pair.atom1.parent.parent.id + pair.atom1.parent.resname + str(pair.atom1.parent.id[1]) + pair.atom1.name + "_" + pair.atom2.parent.parent.id + pair.atom2.parent.resname + str(pair.atom2.parent.id[1]) + pair.atom2.name)
+#            print("attraction", pair.charge_attraction)
+#            print("atom-pair distance", pair.pair_dist)
+#            print("atom-pair eff_max", pair.eff_max)
+#            print("atom1 depth and eff", pair.atom1.depth, pair.atom1.eff)
+#            print("atom2 depth and eff", pair.atom2.depth, pair.atom2.eff)
+#            print("Coulombic attraction", pair.coulombic_score, "\n")
+
+
+
+
+
+#    all_hnet_cands = get_all_hnet_cands(donor_acceptor_set, model, model_dssp)     # list of all possible HBondPair objects - respecting valency only at individual D-A level
+#    for hbond in all_hnet_cands:
+#        if is_coord_in_tensor(hbond.d_a_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+#            print(hbond, hbond.d_a_centre, "is within tensor bounds")
+#            print("HBond count incremented for", hbond)
+#            x, y, z = get_xyz_indices(hbond.d_a_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#            sample_xyzc_nparray[x][y][z][hpossnetcount_channel] += abs(1)       # here naively incrementing count by 1
+#        else:
+#            print(hbond, hbond.d_a_centre, "IS OUT OF TENSOR BOUNDS")
+#            continue
+#
+#    enthalpy_order_list = get_enthalpy_order(donor_acceptor_set, model)     # list of HBondPair objects - respecting valency
+#    for hbond in enthalpy_order_list:
+#        if is_coord_in_tensor(hbond.d_a_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels):
+#            print(hbond, hbond.d_a_centre, "is within tensor bounds")
+#            print("Enthalpy to be added is", hbond.enthalpy)
+#            x, y, z = get_xyz_indices(hbond.d_a_centre, model[chain][res_num]["CA"].coord, voxel_edge, num_row_voxels)
+#            sample_xyzc_nparray[x][y][z][henthalpy_channel] += abs(hbond.enthalpy)
+#        else:
+#            print(hbond, hbond.d_a_centre, "IS OUT OF TENSOR BOUNDS")
+#            continue
+#    print(sample_xyzc_nparray, sample_xyzc_nparray.dtype)
+#    print(sample_xyzc_nparray.shape)
+    return sample_xyzc_nparray
+
+
+def main():
+    if (num_row_voxels % 2) == 0:
+        sys.exit("Expecting number of edge voxels to be odd for centring - EXITING")
+    else:
+        pass
+    wt_h_tensor = make_structure_tensor(pdb_id, wt_h_cif_file, pka_file, chain, res_num, num_row_voxels, voxel_edge, tensor_channels)
+# pdb_id is used to assign a structure id when the structure object is created by MMCIFParser.get_structure()
+#    wt_tensor = make_structure_tensor(pdb_id, wt_cif_file, chain, res_num, num_row_voxels, voxel_edge, c_num, \
+#                                      n_channel, c_channel, o_channel, s_channel, henthalpy_channel, hpossnetcount_channel)
+#    wt_h_tensor = make_structure_tensor(pdb_id, wt_h_cif_file, chain, res_num, num_row_voxels, voxel_edge, c_num, \
+#                                      n_channel, c_channel, o_channel, s_channel, henthalpy_channel, hpossnetcount_channel)
+#    wt_h_tensor = make_structure_tensor(pdb_id, cif_file, chain, res_num, num_row_voxels, voxel_edge, c_num, \
+#                                      n_channel, c_channel, o_channel, s_channel, henthalpy_channel, hpossnetcount_channel)
+#    mut_tensor = make_structure_tensor(pdb_id, mut_cif_file, chain, res_num, num_row_voxels, voxel_edge, c_num, \
+#                                      n_channel, c_channel, o_channel, s_channel, henthalpy_channel, hpossnetcount_channel)
+#    diff_tensor = np.subtract(wt_tensor, mut_tensor)
+#    print(wt_tensor, wt_tensor.shape, "\n\n")
+    print(wt_h_tensor, wt_h_tensor.shape, "\n\n")
+#    print(mut_tensor, mut_tensor.shape, "\n\n")
+#    print(diff_tensor, diff_tensor.shape, "\n\n")
+
+if __name__ == "__main__":
+    main()
